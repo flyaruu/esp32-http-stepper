@@ -3,7 +3,7 @@ use core::{convert::Infallible, time::Duration};
 
 use accel_stepper::{Device, SystemClock};
 use embedded_hal::digital::{OutputPin, ToggleableOutputPin};
-use hal::{gpio::{Gpio1, Output, PushPull, Gpio2}, Rtc};
+use hal::Rtc;
 
 
 pub struct StepperClock {
@@ -16,12 +16,12 @@ impl SystemClock for StepperClock {
     }
 }
 
-pub struct Stepper {
-    pub dir: Gpio1<Output<PushPull>>,
-    pub step_pin: Gpio2<Output<PushPull>>,
+pub struct Stepper<D: OutputPin, S: ToggleableOutputPin> {
+    pub dir: D,
+    pub step_pin: S,
 }
 
-impl Device for Stepper {
+impl<D: OutputPin, S: ToggleableOutputPin>  Device for Stepper<D,S> {
     type Error = Infallible;
 
     fn step(&mut self, ctx: &accel_stepper::StepContext) -> Result<(), Self::Error> {
