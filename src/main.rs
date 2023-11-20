@@ -3,16 +3,18 @@
 #![feature(type_alias_impl_trait)]
 
 extern crate alloc;
-use core::mem::MaybeUninit;
+use core::{mem::MaybeUninit, cell::RefCell};
+use alloc::rc::Rc;
 use embassy_executor::Executor;
 use embassy_net::{Config, Stack, StackResources};
+use embassy_sync::{channel::{Channel, ReceiveFuture, Receiver, Sender}, blocking_mutex::raw::NoopRawMutex};
 use embassy_time::{Timer, Duration};
 use esp_backtrace as _;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize, wifi::{WifiStaDevice, WifiController, WifiState, WifiEvent, WifiDevice}};
-use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng};
+use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng, gpio::{PushPull, Gpio2, Gpio1, Output}};
 
-use picoserve::{Router, routing::get, response::IntoResponse};
+use picoserve::{Router, routing::get, response::IntoResponse, extract::State};
 
 
 use static_cell::{StaticCell, make_static};
@@ -30,6 +32,8 @@ static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+const QUEUE_SIZE: usize = 10;
 
 fn init_heap() {
     const HEAP_SIZE: usize = 32 * 1024;
@@ -55,6 +59,12 @@ impl picoserve::Timer for EmbassyTimer {
     }
 }
 
+
+#[derive(Clone,Debug)]
+struct MoveCommand {
+    distance: i32,
+}
+
 #[entry]
 fn main() -> ! {
     init_heap();
@@ -73,6 +83,10 @@ fn main() -> ! {
     println!("Hello world!");
 
     let io = IO::new(peripherals.GPIO,peripherals.IO_MUX);
+
+    let pin1 = io.pins.gpio1.into_push_pull_output();
+    let pin2 = io.pins.gpio2.into_push_pull_output();
+
 
     hal::interrupt::enable(hal::peripherals::Interrupt::GPIO, hal::interrupt::Priority::Priority1).unwrap();
 
@@ -107,6 +121,7 @@ fn main() -> ! {
         seed
     ));
 
+    let motor_channel: &'static mut Channel<NoopRawMutex, MoveCommand, QUEUE_SIZE> = make_static!(Channel::new());
 
     let pico_config = make_static!(picoserve::Config {
         start_read_request_timeout: Some(Duration::from_secs(5)),
@@ -116,19 +131,39 @@ fn main() -> ! {
     executor.run(|spawner| {
         spawner.spawn(connection(controller)).unwrap();
         spawner.spawn(net_task(stack)).unwrap();
-        spawner.spawn(web_task(stack,pico_config)).unwrap();
+        spawner.spawn(web_task(stack,pico_config, motor_channel.sender())).unwrap();
+        spawner.spawn(motor(pin1, pin2, motor_channel.receiver())).unwrap();
     })
 }
 
-async fn get_root()-> impl IntoResponse {
-    "hello world!"
+async fn get_root(State(sender): State<Rc<RefCell<Sender<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>>>>)-> impl IntoResponse {
+    sender.borrow().send(MoveCommand { distance: -2000 }).await;
+    "command sent!"
 }
 
+
+
+#[embassy_executor::task]
+async fn motor(mut dir: Gpio1<Output<PushPull>>, mut step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>) {
+    loop {
+        let distance = receiver.receive().await.distance;
+        if distance > 0 {
+            dir.set_high().unwrap();
+        } else {
+            dir.set_low().unwrap();
+        }
+        for _ in 0..distance.abs() {
+            step.toggle().unwrap();
+            Timer::after(Duration::from_micros(700)).await;
+        }
+    }
+}
 
 #[embassy_executor::task]
 async fn web_task(
     stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
     config: &'static picoserve::Config<Duration>,
+    sender: Sender<'static, NoopRawMutex, MoveCommand,QUEUE_SIZE>
 ) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 1024];
@@ -168,14 +203,16 @@ async fn web_task(
         let app = Router::new()
             .route("/", get(get_root))
         ;
-        match picoserve::serve(
+        let state = Rc::new(RefCell::new(sender));
+        match picoserve::serve_with_state(
             &app,
             EmbassyTimer,
             config,
             &mut [0; 2048],
             socket_rx,
             socket_tx,
-            )
+            &state
+        )
         .await
         {
             Ok(handled_requests_count) => {
