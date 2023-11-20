@@ -19,7 +19,8 @@ embedded-svc = { version = "0.26.1", default-features = false, features = [] }
 embedded-io = "0.4.0"
 heapless = { version = "0.7.14", default-features = false }
 embassy-time = "0.1.5"
-embassy-executor = { vesion = "0.3.1", features = ["nightly", "integrated-timers","arch-riscv32","executor-thread"] }
+embassy-executor = { version = "0.3.1", features = ["nightly", "integrated-timers","arch-riscv32","executor-thread"] }
+accel-stepper = { git = "https://github.com/flyaruu/accel-stepper/", rev="7104bc0" }
 
 static_cell = { version="=1.2.0", features = ["nightly"] }
 embassy-sync = "0.3.0"
