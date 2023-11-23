@@ -10,13 +10,13 @@ use embassy_executor::Executor;
 use embassy_net::{Config, Stack, StackResources};
 use embassy_sync::{channel::{Channel, Receiver, Sender}, blocking_mutex::raw::NoopRawMutex};
 use embassy_time::{Timer, Duration};
-use embedded_hal::digital::{OutputPin, ToggleableOutputPin};
+
 use esp_backtrace as _;
 use esp_println::println;
-use esp_wifi::{EspWifiInitFor, initialize, wifi::WifiStaDevice};
+use esp_wifi::{EspWifiInitFor, initialize, wifi::{WifiStaDevice, WifiController, WifiState, WifiEvent, WifiDevice}};
 use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng, gpio::{PushPull, Gpio2, Gpio1, Output}, Rtc};
 
-use picoserve::{Router, routing::get, response::IntoResponse, extract::{State, Form, FromRequest, FormRejection}};
+use picoserve::{Router, routing::get, response::IntoResponse, extract::{State, Form}};
 
 
 use serde::Deserialize;
@@ -25,18 +25,19 @@ use static_cell::{StaticCell, make_static};
 
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
-use stepper::{Stepper, StepperClock};
-
-use crate::net::{connection, net_task, web_task};
+use stepper::{EspRtc, Stepper};
 // use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 
+
 mod stepper;
-mod net;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
 
 // static CHANNEL: Channel<CriticalSectionRawMutex,MoveCommand,5> = Channel::new();
+
+const SSID: &str = env!("SSID");
+const PASSWORD: &str = env!("PASSWORD");
 
 const QUEUE_SIZE: usize = 10;
 
@@ -72,11 +73,6 @@ struct MoveCommand {
     accel: u32,
 }
 
-struct AppState {
-    sender: Sender<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>,
-}
-
-
 #[entry]
 fn main() -> ! {
     init_heap();
@@ -100,6 +96,9 @@ fn main() -> ! {
     let pin2 = io.pins.gpio2.into_push_pull_output();
 
 
+
+    let rtc: &'static Rtc<'static> = make_static!(Rtc::new(peripherals.RTC_CNTL));
+
     hal::interrupt::enable(hal::peripherals::Interrupt::GPIO, hal::interrupt::Priority::Priority1).unwrap();
 
     let executor = EXECUTOR.init(Executor::new());
@@ -107,8 +106,6 @@ fn main() -> ! {
     let timer_group = TimerGroup::new(peripherals.TIMG0, &clocks);    
     embassy::init(&clocks,timer_group.timer0);
     // accel_stepper::Device
-
-    let rtc = Rtc::new(peripherals.RTC_CNTL);
 
     let timer = SystemTimer::new(peripherals.SYSTIMER).alarm0;
     let init = initialize(
@@ -142,41 +139,146 @@ fn main() -> ! {
         read_request_timeout: Some(Duration::from_secs(1)),
     });
 
-    let app_state = Rc::new(RefCell::new(AppState{ sender: motor_channel.sender()}));
-
     executor.run(|spawner| {
         spawner.spawn(connection(controller)).unwrap();
         spawner.spawn(net_task(stack)).unwrap();
-        spawner.spawn(web_task(stack,pico_config, app_state)).unwrap();
-        spawner.spawn(motor_1(pin1, pin2, motor_channel.receiver(),rtc)).unwrap();
+        spawner.spawn(web_task(stack,pico_config, motor_channel.sender())).unwrap();
+        spawner.spawn(motor(pin1, pin2, motor_channel.receiver(),rtc)).unwrap();
     })
 }
 
-async fn get_root(Form(payload): Form<MoveCommand>, State(app_state): State<Rc<RefCell<AppState>>>)-> impl IntoResponse {
-    app_state.borrow().sender.send( payload).await;
+async fn get_root(Form(payload): Form<MoveCommand>, State(sender): State<Rc<RefCell<Sender<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>>>>)-> impl IntoResponse {
+    sender.borrow().send(payload).await;
     "command sent!"
 }
 
 #[embassy_executor::task]
-async fn motor_1(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: Rtc<'static>) {
-    motor(dir, step, receiver, rtc).await
-}
-
-
-async fn motor<D: OutputPin, S: ToggleableOutputPin>(dir: D, step: S, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: Rtc<'static>) {
-    let mut stepper = Stepper { dir, step_pin: step };
+async fn motor(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
     let mut driver = Driver::default();
-    let clock = StepperClock { rtc };
+
+
+    let clock = EspRtc::new(&rtc);
+    let mut device = Stepper::new(dir,step);
+    // driver.poll(device, clock);
     loop {
         let command = receiver.receive().await;
-        driver.set_acceleration(command.accel as f32);
         driver.set_max_speed(command.speed as f32);
+        driver.set_acceleration(command.accel as f32);            
         driver.move_by(command.distance as i64);
-        while driver.distance_to_go().abs() > 0  {
-            driver.poll(&mut stepper, &clock).unwrap();
+        while driver.is_running() {
+            driver.poll(&mut device, &clock).unwrap();          
             Timer::after(Duration::from_micros(10)).await;
         }
-
+        println!("Command complete");
     }
 }
 
+
+#[embassy_executor::task]
+async fn web_task(
+    stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
+    config: &'static picoserve::Config<Duration>,
+    sender: Sender<'static, NoopRawMutex, MoveCommand,QUEUE_SIZE>
+) -> ! {
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1024];
+
+    loop {
+        if stack.is_link_up() {
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    println!("Waiting to get IP address...");
+    loop {
+        if let Some(config) = stack.config_v4() {
+            println!("Got IP: {}", config.address);
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    loop {
+        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+
+        log::info!("Listening on TCP:80...");
+        if let Err(e) = socket.accept(80).await {
+            log::warn!("accept error: {:?}", e);
+            continue;
+        }
+
+        log::info!(
+            "Received connection from {:?}",
+            socket.remote_endpoint()
+        );
+
+        let (socket_rx, socket_tx) = socket.split();
+
+        let app = Router::new()
+            .route("/", get(get_root))
+        ;
+        let state = Rc::new(RefCell::new(sender));
+        match picoserve::serve_with_state(
+            &app,
+            EmbassyTimer,
+            config,
+            &mut [0; 2048],
+            socket_rx,
+            socket_tx,
+            &state
+        )
+        .await
+        {
+            Ok(handled_requests_count) => {
+                log::info!(
+                    "{handled_requests_count} requests handled from {:?}",
+                    socket.remote_endpoint()
+                );
+            }
+            Err(err) => log::error!("{err:?}"),
+        }
+    }
+}
+
+
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+    println!("start connection task");
+    loop {
+        match esp_wifi::wifi::get_wifi_state() {
+            WifiState::StaConnected => {
+                // wait until we're no longer connected
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                Timer::after(Duration::from_millis(5000)).await
+            }
+            _ => {}
+        }
+        
+        if !matches!(controller.is_ap_enabled(), Ok(true)) {
+            let client_config = Configuration::Client(ClientConfiguration {
+                ssid: SSID.into(),
+                password: PASSWORD.into(),
+                ..Default::default()
+            });
+            controller.set_configuration(&client_config).unwrap();
+            println!("Starting wifi");
+            controller.start().await.unwrap();
+            println!("Wifi started!");
+        }
+        println!("About to connect...");
+
+        match controller.connect().await {
+            Ok(_) => println!("Wifi connected!"),
+            Err(e) => {
+                println!("Failed to connect to wifi: {e:?}");
+                Timer::after(Duration::from_millis(5000)).await
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<WifiDevice<'static,WifiStaDevice >>) {
+    stack.run().await
+}
