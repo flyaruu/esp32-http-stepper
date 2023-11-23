@@ -1,20 +1,20 @@
 use accel_stepper::{Device, SystemClock};
 
 use embedded_hal::digital::{OutputPin, ToggleableOutputPin};
-use hal::{gpio::{PushPull, Output, Gpio1, Gpio2}, Rtc};
+use hal::Rtc;
 
-pub struct Stepper {
-    dir_pin: Gpio1<Output<PushPull>>,
-    step_pin: Gpio2<Output<PushPull>>,
+pub struct Stepper<D, S> {
+    dir_pin: D,
+    step_pin: S,
 }
 
-impl Stepper {
-    pub fn new(dir_pin: Gpio1<Output<PushPull>>, step_pin: Gpio2<Output<PushPull>>)->Self {
+impl <D,S> Stepper<D, S> {
+    pub fn new(dir_pin: D, step_pin: S)->Self {
         Stepper { dir_pin, step_pin }
     }
 }
 
-impl Device for Stepper {
+impl <D: OutputPin, S: ToggleableOutputPin> Device for Stepper<D, S> {
     type Error = ();
 
     fn step(&mut self, ctx: &accel_stepper::StepContext) -> Result<(), Self::Error> {

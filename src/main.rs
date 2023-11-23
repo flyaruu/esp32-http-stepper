@@ -11,12 +11,13 @@ use embassy_net::{Config, Stack, StackResources};
 use embassy_sync::{channel::{Channel, Receiver, Sender}, blocking_mutex::raw::NoopRawMutex};
 use embassy_time::{Timer, Duration};
 
+use embedded_hal::digital::{OutputPin, ToggleableOutputPin};
 use esp_backtrace as _;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize, wifi::{WifiStaDevice, WifiController, WifiState, WifiEvent, WifiDevice}};
-use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng, gpio::{PushPull, Gpio2, Gpio1, Output}, Rtc};
+use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng, gpio::{PushPull, Gpio2, Gpio1, Output, Gpio6, Gpio7}, Rtc};
 
-use picoserve::{Router, routing::get, response::IntoResponse, extract::{State, Form}};
+use picoserve::{Router, routing::{get, parse_path_segment}, response::IntoResponse, extract::{State, Form}};
 
 
 use serde::Deserialize;
@@ -73,6 +74,10 @@ struct MoveCommand {
     accel: u32,
 }
 
+struct AppState {
+    senders: [Sender<'static, NoopRawMutex, MoveCommand, QUEUE_SIZE>; 2]
+}
+
 #[entry]
 fn main() -> ! {
     init_heap();
@@ -95,6 +100,8 @@ fn main() -> ! {
     let pin1 = io.pins.gpio1.into_push_pull_output();
     let pin2 = io.pins.gpio2.into_push_pull_output();
 
+    let pin6 = io.pins.gpio6.into_push_pull_output();
+    let pin7 = io.pins.gpio7.into_push_pull_output();
 
 
     let rtc: &'static Rtc<'static> = make_static!(Rtc::new(peripherals.RTC_CNTL));
@@ -132,7 +139,10 @@ fn main() -> ! {
         seed
     ));
 
-    let motor_channel: &'static mut Channel<NoopRawMutex, MoveCommand, QUEUE_SIZE> = make_static!(Channel::new());
+    let motor_channel_1: &'static mut Channel<NoopRawMutex, MoveCommand, QUEUE_SIZE> = make_static!(Channel::new());
+    let motor_channel_2: &'static mut Channel<NoopRawMutex, MoveCommand, QUEUE_SIZE> = make_static!(Channel::new());
+
+    let motor_senders = [motor_channel_1.sender(),motor_channel_2.sender()];
 
     let pico_config = make_static!(picoserve::Config {
         start_read_request_timeout: Some(Duration::from_secs(5)),
@@ -142,18 +152,30 @@ fn main() -> ! {
     executor.run(|spawner| {
         spawner.spawn(connection(controller)).unwrap();
         spawner.spawn(net_task(stack)).unwrap();
-        spawner.spawn(web_task(stack,pico_config, motor_channel.sender())).unwrap();
-        spawner.spawn(motor(pin1, pin2, motor_channel.receiver(),rtc)).unwrap();
+        spawner.spawn(web_task(stack,pico_config, motor_senders)).unwrap();
+        spawner.spawn(motor_1(pin1, pin2, motor_channel_1.receiver(),rtc)).unwrap();
+        spawner.spawn(motor_2(pin6, pin7, motor_channel_2.receiver(),rtc)).unwrap();
     })
 }
 
-async fn get_root(Form(payload): Form<MoveCommand>, State(sender): State<Rc<RefCell<Sender<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>>>>)-> impl IntoResponse {
-    sender.borrow().send(payload).await;
+async fn get_root(motor_index: usize, Form(payload): Form<MoveCommand>, State(app_state): State<Rc<RefCell<AppState>>>)-> impl IntoResponse {
+    app_state.borrow().senders[motor_index].send(payload).await;
     "command sent!"
 }
 
 #[embassy_executor::task]
-async fn motor(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
+async fn motor_1(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
+    motor(dir, step, receiver, rtc).await;
+}
+
+#[embassy_executor::task]
+async fn motor_2(dir: Gpio6<Output<PushPull>>, step: Gpio7<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
+    motor(dir, step, receiver, rtc).await;
+}
+
+
+
+async fn motor<D: OutputPin, S: ToggleableOutputPin>(dir: D, step: S, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
     let mut driver = Driver::default();
 
 
@@ -178,7 +200,7 @@ async fn motor(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, rece
 async fn web_task(
     stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
     config: &'static picoserve::Config<Duration>,
-    sender: Sender<'static, NoopRawMutex, MoveCommand,QUEUE_SIZE>
+    senders: [Sender<'static, NoopRawMutex, MoveCommand,QUEUE_SIZE>;2]
 ) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 1024];
@@ -216,9 +238,9 @@ async fn web_task(
         let (socket_rx, socket_tx) = socket.split();
 
         let app = Router::new()
-            .route("/", get(get_root))
+            .route(("/cmd", parse_path_segment::<usize>()), get(get_root))
         ;
-        let state = Rc::new(RefCell::new(sender));
+        let state = Rc::new(RefCell::new(AppState{senders}));
         match picoserve::serve_with_state(
             &app,
             EmbassyTimer,
