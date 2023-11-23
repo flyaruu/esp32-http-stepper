@@ -4,26 +4,32 @@
 
 extern crate alloc;
 use core::{mem::MaybeUninit, cell::RefCell};
+use accel_stepper::Driver;
 use alloc::rc::Rc;
 use embassy_executor::Executor;
 use embassy_net::{Config, Stack, StackResources};
-use embassy_sync::{channel::{Channel, ReceiveFuture, Receiver, Sender}, blocking_mutex::raw::NoopRawMutex};
+use embassy_sync::{channel::{Channel, Receiver, Sender}, blocking_mutex::raw::NoopRawMutex};
 use embassy_time::{Timer, Duration};
+
 use esp_backtrace as _;
 use esp_println::println;
 use esp_wifi::{EspWifiInitFor, initialize, wifi::{WifiStaDevice, WifiController, WifiState, WifiEvent, WifiDevice}};
-use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng, gpio::{PushPull, Gpio2, Gpio1, Output}};
+use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, IO, timer::TimerGroup, embassy, systimer::SystemTimer, Rng, gpio::{PushPull, Gpio2, Gpio1, Output}, Rtc};
 
-use picoserve::{Router, routing::get, response::IntoResponse, extract::State};
+use picoserve::{Router, routing::get, response::IntoResponse, extract::{State, Form}};
 
 
+use serde::Deserialize;
 use static_cell::{StaticCell, make_static};
 
 
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
+use stepper::{EspRtc, Stepper};
 // use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState};
 
+
+mod stepper;
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
@@ -60,9 +66,11 @@ impl picoserve::Timer for EmbassyTimer {
 }
 
 
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,Deserialize)]
 struct MoveCommand {
     distance: i32,
+    speed: u32,
+    accel: u32,
 }
 
 #[entry]
@@ -87,6 +95,9 @@ fn main() -> ! {
     let pin1 = io.pins.gpio1.into_push_pull_output();
     let pin2 = io.pins.gpio2.into_push_pull_output();
 
+
+
+    let rtc: &'static Rtc<'static> = make_static!(Rtc::new(peripherals.RTC_CNTL));
 
     hal::interrupt::enable(hal::peripherals::Interrupt::GPIO, hal::interrupt::Priority::Priority1).unwrap();
 
@@ -132,32 +143,36 @@ fn main() -> ! {
         spawner.spawn(connection(controller)).unwrap();
         spawner.spawn(net_task(stack)).unwrap();
         spawner.spawn(web_task(stack,pico_config, motor_channel.sender())).unwrap();
-        spawner.spawn(motor(pin1, pin2, motor_channel.receiver())).unwrap();
+        spawner.spawn(motor(pin1, pin2, motor_channel.receiver(),rtc)).unwrap();
     })
 }
 
-async fn get_root(State(sender): State<Rc<RefCell<Sender<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>>>>)-> impl IntoResponse {
-    sender.borrow().send(MoveCommand { distance: -2000 }).await;
+async fn get_root(Form(payload): Form<MoveCommand>, State(sender): State<Rc<RefCell<Sender<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>>>>)-> impl IntoResponse {
+    sender.borrow().send(payload).await;
     "command sent!"
 }
 
-
-
 #[embassy_executor::task]
-async fn motor(mut dir: Gpio1<Output<PushPull>>, mut step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>) {
+async fn motor(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
+    let mut driver = Driver::default();
+
+
+    let clock = EspRtc::new(&rtc);
+    let mut device = Stepper::new(dir,step);
+    // driver.poll(device, clock);
     loop {
-        let distance = receiver.receive().await.distance;
-        if distance > 0 {
-            dir.set_high().unwrap();
-        } else {
-            dir.set_low().unwrap();
+        let command = receiver.receive().await;
+        driver.set_max_speed(command.speed as f32);
+        driver.set_acceleration(command.accel as f32);            
+        driver.move_by(command.distance as i64);
+        while driver.is_running() {
+            driver.poll(&mut device, &clock).unwrap();          
+            Timer::after(Duration::from_micros(10)).await;
         }
-        for _ in 0..distance.abs() {
-            step.toggle().unwrap();
-            Timer::after(Duration::from_micros(700)).await;
-        }
+        println!("Command complete");
     }
 }
+
 
 #[embassy_executor::task]
 async fn web_task(
