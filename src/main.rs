@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(async_fn_in_trait)]
 
 extern crate alloc;
 use core::{mem::MaybeUninit, cell::RefCell};
@@ -74,6 +75,8 @@ struct MoveCommand {
     accel: u32,
 }
 
+// AppState is the shared state of the HTTP webapp, it can be accessed by passing
+// an 'Axum-style' extractor to the handlers.
 struct AppState {
     senders: [Sender<'static, NoopRawMutex, MoveCommand, QUEUE_SIZE>; 2]
 }
@@ -142,6 +145,7 @@ fn main() -> ! {
     let motor_channel_1: &'static mut Channel<NoopRawMutex, MoveCommand, QUEUE_SIZE> = make_static!(Channel::new());
     let motor_channel_2: &'static mut Channel<NoopRawMutex, MoveCommand, QUEUE_SIZE> = make_static!(Channel::new());
 
+    // Take the two sending sides of the channels, and pass them to the web endpoint
     let motor_senders = [motor_channel_1.sender(),motor_channel_2.sender()];
 
     let pico_config = make_static!(picoserve::Config {
@@ -158,10 +162,17 @@ fn main() -> ! {
     })
 }
 
-async fn get_root(motor_index: usize, Form(payload): Form<MoveCommand>, State(app_state): State<Rc<RefCell<AppState>>>)-> impl IntoResponse {
+// This endpoint will receive commands as an HTTP form
+// motor_index: which motor are we driving, extracted from the path
+// Form(payload): Destructures the form data into a MoveCommand structure
+// State(app_state): Destructures the appstate, which creates the senders
+async fn post_command(motor_index: usize, Form(payload): Form<MoveCommand>, State(app_state): State<Rc<RefCell<AppState>>>)-> impl IntoResponse {
     app_state.borrow().senders[motor_index].send(payload).await;
     "command sent!"
 }
+
+// Create two instances of a motor task, with different pins.
+// embassy tasks can not be generic so we need to use concrete Gpio pin types
 
 #[embassy_executor::task]
 async fn motor_1(dir: Gpio1<Output<PushPull>>, step: Gpio2<Output<PushPull>>, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
@@ -174,7 +185,8 @@ async fn motor_2(dir: Gpio6<Output<PushPull>>, step: Gpio7<Output<PushPull>>, re
 }
 
 
-
+// Take two pins (direction and step) as well as a receiver through which this task will
+// receive motor commands. 
 async fn motor<D: OutputPin, S: ToggleableOutputPin>(dir: D, step: S, receiver: Receiver<'static, NoopRawMutex,MoveCommand,QUEUE_SIZE>, rtc: &'static Rtc<'static>) {
     let mut driver = Driver::default();
 
@@ -238,7 +250,7 @@ async fn web_task(
         let (socket_rx, socket_tx) = socket.split();
 
         let app = Router::new()
-            .route(("/cmd", parse_path_segment::<usize>()), get(get_root))
+            .route(("/cmd", parse_path_segment::<usize>()), get(post_command))
         ;
         let state = Rc::new(RefCell::new(AppState{senders}));
         match picoserve::serve_with_state(

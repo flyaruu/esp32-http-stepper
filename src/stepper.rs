@@ -13,7 +13,7 @@ impl <D,S> Stepper<D, S> {
         Stepper { dir_pin, step_pin }
     }
 }
-
+// Implement the Device trait on our stepper struct to drive a bipolar-style stepper motor:
 impl <D: OutputPin, S: ToggleableOutputPin> Device for Stepper<D, S> {
     type Error = ();
 
@@ -39,6 +39,9 @@ impl <'a>EspRtc<'a> {
     }
 }
 
+// We need an implementation of the SystemClock trait, that will control the accel stepper
+// The only thing it needs is a measurement of time-since-beginning, so it can measure time
+// between events
 impl <'a>SystemClock for EspRtc<'a> {
     fn elapsed(&self) -> core::time::Duration {
         core::time::Duration::from_micros(self.rtc.get_time_us())
